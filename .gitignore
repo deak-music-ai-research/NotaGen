@@ -1,0 +1,30 @@
+# Model weights and other large files (download with scripts/download_weights.sh)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Generated output
+gradio/output/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments and secrets
+.env
+.venv/
+venv/
+
+# Logs, HPC job files, editor and OS files
+logs/
+*.log
+slurm-*.out
+.vscode/
+.idea/
+.DS_Store
+
+# Gradio cache
+.gradio/

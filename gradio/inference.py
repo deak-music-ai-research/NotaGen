@@ -108,6 +108,7 @@ def rest_unreduce(abc_lines):
 
     part_symbol_list = []
     voice_group_list = []
+    existed_voices = []
     for line in metadata_lines:
         if line.startswith('%%score'):
             for round_bracket_match in re.findall(r'\((.*?)\)', line):
@@ -185,12 +186,63 @@ def rest_unreduce(abc_lines):
     return unreduced_lines
 
 
-def inference_patch(period, composer, instrumentation):
+
+def prepare_starter_abc(starter_abc, prompt_lines, continuation_bars):
+    # starter_abc comes from make_starter(), so it is already interleaved, rest-omitted ABC
+    lines = [line.strip() for line in starter_abc.splitlines() if line.strip()]
+    lines = [
+        line for line in lines
+        if not line.startswith('X:') and (not line.startswith('%') or line.startswith('%%'))
+    ]
+ 
+    body_index = next(
+        (index for index, line in enumerate(lines) if line.startswith('[V:') or line.startswith('[r:')),
+        None,
+    )
+    if body_index is None:
+        raise ValueError("Could not find any music in the starter score.")
+ 
+    metadata_lines = lines[:body_index]
+    body_lines = lines[body_index:]
+ 
+    # a final barline tells the model the piece is finished, so use a normal barline instead
+    body_lines[-1] = body_lines[-1].replace('|]', '|')
+ 
+    tagged_body_lines = []
+    for index, line in enumerate(body_lines):
+        line = re.sub(r'^\[r:[^\]]*\]', '', line)
+        remaining_bars = len(body_lines) - index - 1 + continuation_bars
+        tagged_body_lines.append(f'[r:{index}/{remaining_bars}]' + line)
+ 
+    metadata_text = ''.join(f'{line}\n' for line in metadata_lines)
+    body_text = '\n'.join(tagged_body_lines)
+    if starter_abc.endswith('\n'):
+        body_text += '\n'
+ 
+    return ''.join(prompt_lines) + metadata_text + body_text, metadata_text, body_text
+
+
+def inference_patch(period, composer, instrumentation, starter_abc=None, continuation_bars=64):
 
     prompt_lines=[
     '%' + period + '\n',
     '%' + composer + '\n',
     '%' + instrumentation + '\n']
+
+    if starter_abc is not None:
+        if not 1 <= continuation_bars <= 256:
+            raise ValueError("Continuation length must be between 1 and 256 bars.")
+        starter_context, metadata_text, body_text = prepare_starter_abc(
+            starter_abc, prompt_lines, continuation_bars
+        )
+        encoded_context = patchilizer.encode_generate(
+            starter_context, patch_length=PATCH_LENGTH + 1
+        )
+        if len(encoded_context) > PATCH_LENGTH:
+            raise ValueError(
+                f"The ABC prefix is too long for the model context (maximum {PATCH_LENGTH} patches). "
+                "Shorten the starter score and try again."
+            )
 
     while True:
 
@@ -200,23 +252,33 @@ def inference_patch(period, composer, instrumentation):
 
         start_time = time.time()
 
-        prompt_patches = patchilizer.patchilize_metadata(prompt_lines)
-        byte_list = list(''.join(prompt_lines))
-        context_tunebody_byte_list = []
-        metadata_byte_list = []
+        if starter_abc is None:
+            prompt_patches = patchilizer.patchilize_metadata(prompt_lines)
+            byte_list = list(''.join(prompt_lines))
+            context_tunebody_byte_list = []
+            metadata_byte_list = []
 
-        print(''.join(byte_list), end='')
+            print(''.join(byte_list), end='')
 
-        prompt_patches = [[ord(c) for c in patch] + [patchilizer.special_token_id] * (PATCH_SIZE - len(patch)) for patch
-                          in prompt_patches]
-        prompt_patches.insert(0, bos_patch)
+            prompt_patches = [
+                [ord(c) for c in patch] + [patchilizer.special_token_id] * (PATCH_SIZE - len(patch))
+                for patch in prompt_patches
+            ]
+            prompt_patches.insert(0, bos_patch)
+            input_patches = torch.tensor(prompt_patches, device=device).reshape(1, -1)
+            tunebody_flag = False
+        else:
+            byte_list = list(starter_context)
+            metadata_byte_list = list(''.join(prompt_lines) + metadata_text)
+            context_tunebody_byte_list = list(body_text)
+            print(starter_context, end='')
 
-        input_patches = torch.tensor(prompt_patches, device=device).reshape(1, -1)
+            flattened_context = [item for patch in encoded_context for item in patch]
+            input_patches = torch.tensor([flattened_context], device=device).reshape(1, -1)
+            tunebody_flag = True
 
         end_flag = False
         cut_index = None
-
-        tunebody_flag = False
 
         with torch.inference_mode():
             
@@ -289,7 +351,7 @@ def inference_patch(period, composer, instrumentation):
                     input_patches = torch.tensor([input_patches], device=device)
                     input_patches = input_patches.reshape(1, -1)
 
-                    context_tunebody_byte_list = list(''.join(context_tunebody_lines[-cut_index:]))
+                    context_tunebody_byte_list = list(''.join(context_tunebody_liness[-cut_index:]))
 
             if not failure_flag:
                 abc_text = ''.join(byte_list)

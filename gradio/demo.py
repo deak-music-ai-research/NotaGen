@@ -4,9 +4,13 @@ import threading
 import queue
 from io import TextIOBase
 from inference import inference_patch
+from starter_prep import make_starter
 import datetime
 import subprocess
 import os
+import tempfile
+import traceback
+import re
 
 # Predefined valid combinations set
 with open('prompts.txt', 'r') as f:
@@ -56,22 +60,37 @@ class RealtimeStream(TextIOBase):
         return len(text)
 
 
-def save_and_convert(abc_content, period, composer, instrumentation):
-    if not all([period, composer, instrumentation]):
-        raise gr.Error("Please complete a valid generation first before saving")
-    
+def save_and_convert(abc_content, period, composer, instrumentation, generation_mode, starter_file=None):
+    if not abc_content:
+        raise gr.Error("Generate a composition before saving")
+    if generation_mode == "Generate from prompt":
+        if (period, composer, instrumentation) not in valid_combinations:
+            raise gr.Error("Please complete a valid generation first before saving")
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    prompt_str = f"{period}_{composer}_{instrumentation}"
+    if generation_mode == "Generate from prompt":
+        prompt_str = re.sub(r'[^A-Za-z0-9._-]+', '_',
+                    f"{period}_{composer}_{instrumentation}")
+    elif starter_file:
+        stem = os.path.splitext(os.path.basename(starter_file))[0]
+        stem = re.sub(r'^\d{8}_\d{6}_', '', stem)       # drop a leading timestamp from re-uploaded outputs
+        stem = re.sub(r'(_continued)+$', '', stem)      # avoid "_continued_continued"
+        prompt_str = re.sub(r'[^A-Za-z0-9._-]+', '_', stem) + "_continued"
+    else:
+        prompt_str = "Continuation"
     filename_base = f"{timestamp}_{prompt_str}"
+
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
     
-    abc_filename = f"{filename_base}.abc"
+    abc_filename = os.path.join(output_dir, f"{filename_base}.abc")
     with open(abc_filename, "w", encoding="utf-8") as f:
         f.write(abc_content)
 
-    xml_filename = f"{filename_base}.xml"
+    xml_filename = os.path.join(output_dir, f"{filename_base}.xml")
     try:
         subprocess.run(
-            ["python", "abc2xml.py", '-o', '.', abc_filename, ],
+            ["python", "abc2xml.py", '-o', output_dir, abc_filename, ],
             check=True,
             capture_output=True,
             text=True
@@ -83,19 +102,60 @@ def save_and_convert(abc_content, period, composer, instrumentation):
     return f"Saved successfully: {abc_filename} -> {xml_filename}"
 
 
+def load_starter(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".abc":
+         with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    elif ext in {".xml", ".musicxml", ".mxl"}:
+        converter = os.path.join(os.path.dirname(__file__), "..", "data", "xml2abc.py")
+        with tempfile.TemporaryDirectory(prefix="notagen-xml-") as tmp:
+            subprocess.run([sys.executable, converter, "-d", "8", "-c", "6", "-x", "-o", tmp, path],
+                           check=True, capture_output=True, text=True)
+            out = os.path.join(tmp, os.path.splitext(os.path.basename(path))[0] + ".abc")
+            with open(out, "r", encoding="utf-8") as f:
+                text = f.read()
+    else:
+        raise gr.Error("Please upload an .abc, .xml, .musicxml, or .mxl file")
+    return make_starter(text)
 
-def generate_music(period, composer, instrumentation):
+
+def generate_music(generation_mode, period, composer, instrumentation, starter_abc_file, continuation_bars):
+    starter_abc = None
     if (period, composer, instrumentation) not in valid_combinations:
-        raise gr.Error("Invalid prompt combination! Please re-select from the period options")
-    
+        raise gr.Error("Invalid prompt combination! Please re-select the period, composer, and instrumentation")
+    if generation_mode != "Generate from prompt":
+        if not starter_abc_file:
+            raise gr.Error("Upload an unfinished ABC or MusicXML file to continue")
+        try:
+            starter_abc = load_starter(starter_abc_file)
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.strip() if e.stderr else "The converter returned an error"
+            raise gr.Error(f"MusicXML to ABC conversion failed: {error_msg}") from e
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            raise gr.Error(f"Could not read or convert the uploaded score: {e}") from e
+
+   
     output_queue = queue.Queue()
     original_stdout = sys.stdout
     sys.stdout = RealtimeStream(output_queue)
-    
+
     result_container = []
+    error_container = []
     def run_inference():
         try:
-            result_container.append(inference_patch(period, composer, instrumentation))
+            result_container.append(
+                inference_patch(
+                    period,
+                    composer,
+                    instrumentation,
+                    starter_abc=starter_abc,
+                    continuation_bars=continuation_bars,
+                )
+            )
+        except Exception as e:
+            traceback.print_exc(file=sys.__stderr__)
+            error_container.append(e)
         finally:
             sys.stdout = original_stdout
     
@@ -115,9 +175,23 @@ def generate_music(period, composer, instrumentation):
         text = output_queue.get()
         process_output += text
         yield process_output, None
-    
+
+    if error_container:
+        raise gr.Error(f"Generation failed: {error_container[0]}")
+
     final_result = result_container[0] if result_container else ""
     yield process_output, final_result
+
+
+def update_generation_mode(generation_mode):
+    prompt_mode = generation_mode == "Generate from prompt"
+    return (
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=not prompt_mode),
+        gr.update(visible=not prompt_mode),
+    )
 
 with gr.Blocks() as demo:
     gr.Markdown("## NotaGen")
@@ -125,6 +199,11 @@ with gr.Blocks() as demo:
     with gr.Row():
         # 左侧栏
         with gr.Column():
+            generation_mode = gr.Radio(
+                choices=["Generate from prompt", "Continue from a score file"],
+                value="Generate from prompt",
+                label="Generation mode",
+            )
             period_dd = gr.Dropdown(
                 choices=periods,
                 value=None, 
@@ -142,6 +221,20 @@ with gr.Blocks() as demo:
                 value=None,
                 label="Instrumentation",
                 interactive=False
+            )
+            starter_abc_file = gr.File(
+                label="Unfinished ABC or MusicXML file (experimental)",
+                file_types=[".abc", ".xml", ".musicxml", ".mxl"],
+                type="filepath",
+                visible=False,
+            )
+            continuation_bars = gr.Slider(
+                minimum=1,
+                maximum=256,
+                step=1,
+                value=64,
+                label="Continuation target (bars, approximate)",
+                visible=False,
             )
             
             generate_btn = gr.Button("Generate!", variant="primary")
@@ -185,16 +278,29 @@ with gr.Blocks() as demo:
         inputs=[period_dd, composer_dd],
         outputs=[composer_dd, instrument_dd]
     )
+
+    generation_mode.change(
+        update_generation_mode,
+        inputs=[generation_mode],
+        outputs=[period_dd, composer_dd, instrument_dd, starter_abc_file, continuation_bars]
+    )
     
     generate_btn.click(
         generate_music,
-        inputs=[period_dd, composer_dd, instrument_dd],
+        inputs=[
+            generation_mode,
+            period_dd,
+            composer_dd,
+            instrument_dd,
+            starter_abc_file,
+            continuation_bars,
+        ],
         outputs=[process_output, final_output]
     )
     
     save_btn.click(
         save_and_convert,
-        inputs=[final_output, period_dd, composer_dd, instrument_dd],
+        inputs=[final_output, period_dd, composer_dd, instrument_dd, generation_mode, starter_abc_file],
         outputs=[save_status]
     )
 
@@ -232,5 +338,6 @@ if __name__ == "__main__":
 
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7861
+        server_port=7861,
+        share=True
     )
